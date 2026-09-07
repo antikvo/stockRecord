@@ -23,14 +23,50 @@ git push origin main
 
 ```
 stockRecord/
-├── README.md      # 项目说明
-└── records/       # 陈学长选股策略 v2 推荐日报归档
-    └── YYYY/MM/   # 按 年/月/日 组织
-        ├── …/DD.md   # 每日推荐内容
-        └── …/DD.md
+├── README.md            # 项目说明
+├── .gitignore           # 排除 .keys/（口令/密钥，严禁入库）
+├── records/             # 陈学长选股策略 v2 明文推荐日报
+│   └── YYYY/MM/         #   按 年/月/日 组织
+│       └── DD.md
+├── encrypted/           # 加密版推荐日报（仅代码/名称加密，其余字段明文）
+│   └── YYYY/MM/
+│       └── DD.md
+└── scripts/
+    ├── encrypt_daily.py # 当日加密版生成（方案2：随机密钥+口令解锁）
+    └── decode.py        # 解密验证：输入口令还原名称/代码，供 clone 后核真
 ```
 
-## 陈学长推荐日报归档
+## 加密与解密验证机制
+
+> 核心：**当日只把推荐股的「代码、名称」加密后提交 GitHub（git commit 即时间戳）**，其余字段（总分/阶段/行业/价位等）明文公开；**次日公布当日口令**，任何人 clone 后本地解码，即可核对当日提交内容是否真实、有无被篡改。
+
+### 当日加密版（encrypted/YYYY/MM/DD.md）
+
+- 加密字段：`代码`、`名称`（Fernet：AES-128-CBC + HMAC）
+- 明文保留：总分、阶段、行业、流通市值、低吸/追涨/压力/止损位、竞价门槛等 —— 供有心人按行业+价位反查对应关系
+- 密钥信封：随机 Fernet key 用口令（PBKDF2-SHA256，20 万次）二次加密，存于加密版文件头部（`salt` + `wrapped_key`）
+- 口令规则：`CX-YYYYMMDD-XXXXXX`，当日生成，存本地 `.keys/`（**gitignore，严禁入库**），次日公布
+
+### 次日解密验证（decode.py）
+
+```bash
+# 1. clone 仓库
+git clone git@github.com:antikvo/stockRecord.git
+cd stockRecord
+
+# 2. 安装依赖
+pip install cryptography pandas
+
+# 3. 用当日口令解码验证（口令于次日公布）
+python3 scripts/decode.py --date 20260907 --passphrase CX-20260907-XXXXXX
+# 或直接指定文件
+python3 scripts/decode.py --file encrypted/2026/09/07.md --passphrase CX-20260907-XXXXXX
+```
+
+- **`[Decrypt OK]` + `[VERIFIED]`** → 口令正确、源文件未篡改，与当日提交内容一致
+- **`[FAIL]` / 字段显示「<解密失败>」** → 口令错误，或加密字段被改动过
+
+## 陈学长推荐日报归档（明文）
 
 > 数据来源：陈学长选股策略 v2 的每日推荐报告（`~/stock/strategy_v2/reports/v2_candidates_*.csv`）。
 
