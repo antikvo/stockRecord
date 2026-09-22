@@ -132,6 +132,19 @@ def refresh_tracked(codes: list, lookback_days: int = 45) -> None:
         log(f'⚠️ 被跟踪个股K线刷新失败（归档继续）：{e}')
 
 
+def window_contiguous(dates_present: list, tdays: list) -> bool:
+    """判断该股在窗口内的K线于全局交易历中是否逐日连续（无缺口）。
+
+    缺口会让「多日累计涨跌幅」被当成单日、成交价也会错位，
+    这类样本的涨幅/收益不可信 —— 不计入战绩汇总，并单独标注数量。
+    """
+    if len(dates_present) < 2:
+        return True
+    pos = {d: i for i, d in enumerate(tdays)}
+    idxs = [pos[d] for d in dates_present if d in pos]
+    return all(b - a == 1 for a, b in zip(idxs, idxs[1:]))
+
+
 def perf_for(date: str, rows: list, bars: dict, trade_days: list) -> list:
     """计算某日推荐股票自推荐日起的逐日表现。
 
@@ -179,6 +192,7 @@ def perf_for(date: str, rows: list, bars: dict, trade_days: list) -> list:
                 last_date, last = w[k], c
         if last is None:
             continue
+        present = [d for d in w if d in b]
         out.append({
             'code': code, 'name': name,
             't0': t0, 't1_open': t1_open,
@@ -186,6 +200,7 @@ def perf_for(date: str, rows: list, bars: dict, trade_days: list) -> list:
             'last_date': last_date, 'last': last,
             'ret_rec': (last / t0 - 1) * 100,
             'ret_open': ((last / t1_open - 1) * 100) if t1_open else None,
+            'data_ok': window_contiguous(present, trade_days),
         })
     return out
 
@@ -258,6 +273,10 @@ def simulate_trade(date: str, row: dict, bars: dict, trade_days: list,
 
     trace, sell = [], None
     last_eval = min(i + 1 + hold_n, len(trade_days) - 1)
+    # 窗口内该股K线是否连续 —— 有缺口则成交价/收益不可信，不计入战绩汇总
+    win_dates = [trade_days[k] for k in range(i + 1, last_eval + 1)
+                 if trade_days[k] in b]
+    data_ok = window_contiguous(win_dates, trade_days)
     for k in range(i + 2, last_eval + 1):          # 买入日次日起评估
         d = trade_days[k]
         v = b.get(d)
@@ -285,11 +304,12 @@ def simulate_trade(date: str, row: dict, bars: dict, trade_days: list,
     if not sell:
         return {'status': '持有中', 'buy_date': buy_d, 'buy_price': buy_price,
                 'reason': f'未触发离场（跟踪 {hold_n} 个交易日）',
-                'ret_pct': None, 'trace': trace}
+                'ret_pct': None, 'trace': trace, 'data_ok': data_ok}
     d, px, why, held = sell
     return {'status': '已了结', 'buy_date': buy_d, 'buy_price': buy_price,
             'sell_date': d, 'sell_price': px, 'held_days': held, 'reason': why,
-            'ret_pct': (px / buy_price - 1) * 100, 'trace': trace}
+            'ret_pct': (px / buy_price - 1) * 100, 'trace': trace,
+            'data_ok': data_ok}
 
 
 TRADE_HEADER = ('| 代码 | 名称 | 买入日 | 买入价 | 卖出日 | 卖出价 '
@@ -441,6 +461,116 @@ def build_record(date: str, df: pd.DataFrame, env: dict | None,
           f'> 完整数据：`reports/v2_candidates_{date}.csv`',
           '> ⚠️ 学习用途，非投资建议。', '']
     return '\n'.join(L)
+
+
+def aggregate_stats() -> dict:
+    """全量模拟战绩（只统计已了结且K线连续、数字可信的样本）。"""
+    tdays = market_trade_days()
+    rules = load_exit_rules()
+    dates, codes = [], set()
+    for d_iso in tdays:
+        d = d_iso.replace('-', '')
+        p = os.path.join(ROOT, 'records', d[:4], d[4:6], f'{d[6:8]}.md')
+        if not os.path.exists(p):
+            continue
+        body = open(p, encoding='utf-8').read()
+        sec = body.split('## 推荐股票')[-1].split('## 买卖参考')[0]
+        rows = parse_rec_table(sec)
+        if rows:
+            dates.append(d)
+            codes |= {r['code'] for r in rows}
+    bars = read_bars(sorted(codes))
+    rets, cancelled, unverified = [], 0, 0
+    for d in dates:
+        p = os.path.join(ROOT, 'records', d[:4], d[4:6], f'{d[6:8]}.md')
+        body = open(p, encoding='utf-8').read()
+        sec = body.split('## 推荐股票')[-1].split('## 买卖参考')[0]
+        for r in parse_rec_table(sec):
+            s = simulate_trade(d, r, bars, tdays, rules)
+            if not s:
+                continue
+            if s['status'] == '撤单':
+                cancelled += 1
+            elif s['status'] == '已了结' and s.get('ret_pct') is not None:
+                if s.get('data_ok') is False:
+                    unverified += 1
+                    continue
+                rets.append({'code': r['code'], 'name': r['name'],
+                             'ret': s['ret_pct'], 'reason': s['reason'],
+                             'date': d})
+    if not rets:
+        return {'n': 0}
+    win = [x for x in rets if x['ret'] > 0]
+    loss = [x for x in rets if x['ret'] <= 0]
+    srt = sorted(x['ret'] for x in rets)
+    mid = srt[len(srt) // 2] if len(srt) % 2 else \
+        (srt[len(srt) // 2 - 1] + srt[len(srt) // 2]) / 2
+    avg_w = sum(x['ret'] for x in win) / len(win) if win else 0.0
+    avg_l = sum(x['ret'] for x in loss) / len(loss) if loss else 0.0
+    return {'n': len(rets), 'win': len(win),
+            'win_rate': len(win) / len(rets) * 100,
+            'avg': sum(x['ret'] for x in rets) / len(rets),
+            'median': mid,
+            'best': max(rets, key=lambda x: x['ret']),
+            'worst': min(rets, key=lambda x: x['ret']),
+            'cancelled': cancelled, 'buys': len(rets) + cancelled,
+            'unverified': unverified, 'avg_win': avg_w, 'avg_loss': avg_l,
+            'pl_ratio': (abs(avg_w / avg_l) if avg_l else 0.0), 'rets': rets}
+
+
+def rebuild_stats() -> None:
+    """重建 README 的 <!-- STATS:BEGIN --> ... <!-- STATS:END --> 战绩总览。
+
+    刻意把「当前是负期望」写明，并把口径/取价假设一起公开，
+    使任何人 clone 后能按同样规则复核。
+    """
+    import re
+    readme = os.path.join(ROOT, 'README.md')
+    if not os.path.exists(readme):
+        return
+    txt = open(readme, encoding='utf-8').read()
+    if '<!-- STATS:BEGIN -->' not in txt or '<!-- STATS:END -->' not in txt:
+        return
+    a = aggregate_stats()
+    if not a.get('n'):
+        return
+    # 按月分解
+    mon = {}
+    for x in a['rets']:
+        mon.setdefault(x['date'][:6], []).append(x['ret'])
+    L = ['<!-- STATS:BEGIN -->', '',
+         '## 累计模拟战绩（全量，可复核）', '',
+         '> 本节由 `scripts/archive_daily.py` 自动重建。**当前为负期望**，'
+         '如实展示，不做筛选。',
+         '> 口径：推荐日收盘出信号 → **次日开盘买入** → 逐日判定离场'
+         '（破止损 > 满5交易日了结 > 触压力位且浮盈≥6%止盈）。',
+         '> **未计**手续费、印花税、滑点；触发时按最坏价格成交'
+         '（开盘已破按开盘价，否则按触发价）；买入日盘中破止损则撤单不成交；',
+         '> 跟踪窗口内该股K线有缺口的样本已剔除（不可信），剔除 '
+         f'{a.get("unverified", 0)} 笔。', '',
+         '| 指标 | 数值 |', '|---|---|',
+         f'| 计入战绩样本 | **{a["n"]}** 笔（另有撤单 {a["cancelled"]} 笔） |',
+         f'| 胜率 | **{a["win_rate"]:.1f}%**（{a["win"]} 胜 / {a["n"] - a["win"]} 负） |',
+         f'| 平均收益 | **{a["avg"]:+.2f}%** |',
+         f'| 中位数收益 | {a["median"]:+.2f}% |',
+         f'| 平均盈利 / 平均亏损 | {a["avg_win"]:+.2f}% / {a["avg_loss"]:+.2f}% |',
+         f'| 盈亏比 | {a["pl_ratio"]:.2f} |',
+         f'| 单笔最好 | {a["best"]["name"]} {a["best"]["ret"]:+.2f}% |',
+         f'| 单笔最差 | {a["worst"]["name"]} {a["worst"]["ret"]:+.2f}% |', '']
+    if mon:
+        L += ['按月：', '', '| 月份 | 笔数 | 胜率 | 平均收益 |', '|---|---|---|---|']
+        for m in sorted(mon, reverse=True):
+            v = mon[m]
+            w = len([x for x in v if x > 0])
+            L.append(f'| {m[:4]}-{m[4:]} | {len(v)} | '
+                     f'{w / len(v) * 100:.0f}% | {sum(v) / len(v):+.2f}% |')
+        L.append('')
+    L.append('<!-- STATS:END -->')
+    new = re.sub(r'<!-- STATS:BEGIN -->.*?<!-- STATS:END -->',
+                 '\n'.join(L), txt, flags=re.S)
+    if new != txt:
+        open(readme, 'w', encoding='utf-8').write(new)
+        log(f'README 战绩总览已重建（{a["n"]} 笔样本，平均 {a["avg"]:+.2f}%）')
 
 
 def rebuild_index() -> None:

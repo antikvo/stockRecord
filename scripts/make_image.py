@@ -60,46 +60,8 @@ def load_env(date: str) -> dict:
 
 
 def aggregate_stats() -> dict:
-    """累计模拟战绩（只统计已了结的交易）。"""
-    tdays = A.market_trade_days()
-    rules = A.load_exit_rules()
-    dates, codes = [], set()
-    for d_iso in tdays:
-        d = d_iso.replace('-', '')
-        p = os.path.join(ROOT, 'records', d[:4], d[4:6], f'{d[6:8]}.md')
-        if not os.path.exists(p):
-            continue
-        body = open(p, encoding='utf-8').read()
-        sec = body.split('## 推荐股票')[-1].split('## 买卖参考')[0]
-        rows = A.parse_rec_table(sec)
-        if rows:
-            dates.append(d)
-            codes |= {r['code'] for r in rows}
-    bars = A.read_bars(sorted(codes))
-    rets, cancelled = [], 0
-    for d in dates:
-        p = os.path.join(ROOT, 'records', d[:4], d[4:6], f'{d[6:8]}.md')
-        body = open(p, encoding='utf-8').read()
-        sec = body.split('## 推荐股票')[-1].split('## 买卖参考')[0]
-        for r in A.parse_rec_table(sec):
-            s = A.simulate_trade(d, r, bars, tdays, rules)
-            if not s:
-                continue
-            if s['status'] == '撤单':
-                cancelled += 1
-            elif s['status'] == '已了结' and s.get('ret_pct') is not None:
-                rets.append({'code': r['code'], 'name': r['name'],
-                             'ret': s['ret_pct'], 'reason': s['reason']})
-    if not rets:
-        return {'n': 0}
-    win = [x for x in rets if x['ret'] > 0]
-    best = max(rets, key=lambda x: x['ret'])
-    worst = min(rets, key=lambda x: x['ret'])
-    return {'n': len(rets), 'win': len(win),
-            'win_rate': len(win) / len(rets) * 100,
-            'avg': sum(x['ret'] for x in rets) / len(rets),
-            'best': best, 'worst': worst, 'cancelled': cancelled,
-            'buys': len(rets) + cancelled}
+    """复用 archive_daily 的实现，避免两份口径漂移。"""
+    return A.aggregate_stats()
 
 
 def stage_dist(df: pd.DataFrame) -> list:

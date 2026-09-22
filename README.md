@@ -82,6 +82,9 @@ python3 scripts/archive_daily.py --encrypt          # 同时生成加密版（�
 python3 scripts/archive_daily.py --backfill 20260915 20260922
 ```
 
+<!-- STATS:BEGIN -->
+<!-- STATS:END -->
+
 <!-- PERF:BEGIN -->
 
 > 近 5 个交易日（`2026-09-16` ~ `2026-09-22`）的推荐表现。
