@@ -28,7 +28,8 @@ from datetime import datetime, timedelta
 
 # macOS 系统 Python 的 LibreSSL 会触发 urllib3 的 NotOpenSSLWarning（无害）。
 # 压掉它，保证 launchd 的 stderr 为空 —— 这样真出问题时一眼能看见。
-warnings.filterwarnings('ignore', message='.*NotOpenSSLWarning.*')
+warnings.filterwarnings('ignore', message=r'.*LibreSSL.*')
+warnings.filterwarnings('ignore', message=r'.*NotOpenSSL.*')
 
 import pandas as pd
 
