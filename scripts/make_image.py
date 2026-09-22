@@ -171,6 +171,21 @@ def render_html(date: str, profile: str, df: pd.DataFrame, env: dict,
              else '内部版 · 含个股')
     badge_cls = 'ok' if profile == 'public' else 'warn'
 
+    # 明日介入信号：策略的当日产出，做成醒目卡片。
+    # 措辞按真实流程写 —— 信号只是候选，须次日 09:26 竞价确认后才决定是否介入，
+    # 避免变成"明日必涨"式的荐股口吻。
+    if rec_n > 0:
+        sig_cls, sig_txt = 'has', f'{rec_n}'
+        sig_note = ('护盘确认 / 放量反包<br>次日 09:26 竞价确认后才决定是否介入')
+    else:
+        sig_cls, sig_txt = 'none', '0'
+        sig_note = ('今日无符合条件的标的<br>明日空仓观望，不新开仓')
+    signal_html = f"""<div class="signal {sig_cls}">
+  <div><div class="lb">明日介入信号</div>
+       <div class="nm">{sig_txt}<span>只</span></div></div>
+  <div class="nt">{sig_note}</div>
+</div>"""
+
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <style>
   * {{ margin:0; padding:0; box-sizing:border-box; }}
@@ -215,11 +230,27 @@ def render_html(date: str, profile: str, df: pd.DataFrame, env: dict,
   th {{ color:#8b949e; font-weight:500; font-size:21px; }}
   td.rs {{ font-size:19px; color:#8b949e; }}
   .empty {{ font-size:24px; color:#8b949e; }}
+  .signal {{ margin-top:26px; padding:22px 28px; border-radius:16px;
+             display:flex; align-items:center; justify-content:space-between;
+             background:#161b22; border:1px solid #21262d; }}
+  .signal .lb {{ font-size:25px; color:#8b949e; letter-spacing:2px; }}
+  .signal .nm {{ font-size:62px; font-weight:800; line-height:1.1;
+                 margin-top:2px; }}
+  .signal .nm span {{ font-size:24px; font-weight:400; color:#8b949e;
+                      margin-left:8px; }}
+  .signal .nt {{ font-size:21px; color:#6e7681; text-align:right;
+                 line-height:1.55; }}
+  .signal.has {{ background:linear-gradient(90deg,#132a4a,#161b22);
+                 border:1px solid #1f6feb; }}
+  .signal.has .lb {{ color:#79c0ff; }}
+  .signal.has .nm {{ color:#58a6ff; }}
+  .signal.has .nt {{ color:#8b949e; }}
+  .signal.none .nm {{ color:#6e7681; }}
   .foot {{ margin-top:44px; padding-top:26px; border-top:1px solid #21262d;
            font-size:21px; color:#6e7681; line-height:1.7; }}
 </style></head><body><div class="wrap">
   <div class="badge {badge_cls}">{esc(badge)}</div>
-  <h1>A股盘面 · 陈学长选股策略</h1>
+  <h1>A股盘面 · N字选股策略记录</h1>
   <div class="sub">{d_iso} 星期{wd} ｜ 数据截至 {esc(env.get('data_date', d_iso))}</div>
 
   <div class="env">
@@ -234,6 +265,8 @@ def render_html(date: str, profile: str, df: pd.DataFrame, env: dict,
     <div><b>{esc(f"{float(env.get('zha_ban_rate', 0)) * 100:.0f}%")}</b><span>炸板率</span></div>
     <div><b>{esc(env.get('max_board', '—'))}板</b><span>最高连板</span></div>
   </div>
+
+  {signal_html}
 
   <div class="sec">策略扫描口径</div>
   <div class="chips">
