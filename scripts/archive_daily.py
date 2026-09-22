@@ -135,13 +135,17 @@ def perf_for(date: str, rows: list, bars: dict, trade_days: list) -> list:
     """
     if not rows or date not in trade_days:
         return []
-    i = trade_days.index(date)
+    # 库内日期为 ISO（YYYY-MM-DD），归档脚本用 YYYYMMDD，这里统一转换
+    d_iso = f'{date[:4]}-{date[4:6]}-{date[6:8]}'
+    if d_iso not in trade_days:
+        return []
+    i = trade_days.index(d_iso)
     window = trade_days[i:i + 1 + TRACK_DAYS]      # 推荐日 + 之后 5 个交易日
     nxt = trade_days[i + 1] if i + 1 < len(trade_days) else None
     out = []
     for code, name in rows:
         b = bars.get(code) or {}
-        base = b.get(date)
+        base = b.get(d_iso)
         if not base or not base[1]:
             continue
         base_close = float(base[1])
