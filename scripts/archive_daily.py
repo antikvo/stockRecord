@@ -113,7 +113,7 @@ def read_bars(codes: list) -> dict:
     return out
 
 
-def refresh_tracked(codes: list) -> None:
+def refresh_tracked(codes: list, lookback_days: int = 45) -> None:
     """尽最大努力把被跟踪个股的K线补到最新（失败不影响归档）。"""
     if not codes:
         return
@@ -123,7 +123,7 @@ def refresh_tracked(codes: list) -> None:
         ds = DataStore()
         for c in codes:
             try:
-                ds.fetch_recent(c)
+                ds.fetch_recent(c, lookback_days=lookback_days)
             except Exception:
                 pass
         n = backfill_today_from_tencent(sorted(codes))
@@ -626,6 +626,9 @@ def backfill_history() -> int:
     n = 0
     tdays = market_trade_days()
     rules = load_exit_rules()
+    # 第一遍：找出待回填的记录（老记录对应的个股多半早已掉出候选池，
+    # 库内没有后续K线，必须先补历史，否则会算成 +0.00% / 无K线）
+    todo, codes = [], set()
     for dirpath, _, files in sorted(os.walk(os.path.join(ROOT, 'records'))):
         for fn in sorted(files):
             if not fn.endswith('.md'):
@@ -643,24 +646,31 @@ def backfill_history() -> int:
             rows = parse_rec_table(sec)
             if not rows:
                 continue
-            codes = [r['code'] for r in rows]
-            bars = read_bars(codes)
-            try:
-                add = ['## 历史表现（回填）', '',
-                       '> 本段为**事后回填**（该记录发布时尚未实现跟踪），'
-                       '数据源为库内日线，非当日原文；正文与提交历史均可核对。', '']
-                add += perf_lines(date, rows, bars, tdays,
-                                  title='### 逐日涨幅（自推荐日起）')
-                add += trade_lines(date, rows, bars, tdays, rules,
-                                   title='### 模拟交易（次日开盘买入 → 逐日判定卖出）')
-                if len(add) <= 4:
-                    continue
-                open(p, 'w', encoding='utf-8').write(
-                    body.rstrip() + '\n\n' + '\n'.join(add) + '\n')
-                log(f'{date} 已回填历史表现（{len(rows)} 只）')
-                n += 1
-            except Exception as e:                            # noqa: BLE001
-                log(f'{date} ⚠️ 回填失败：{e}')
+            todo.append((p, date, rows, body))
+            codes |= {r['code'] for r in rows}
+    if not todo:
+        return 0
+    refresh_tracked(sorted(codes), lookback_days=90)
+
+    # 第二遍：计算并写回
+    for p, date, rows, body in todo:
+        bars = read_bars([r['code'] for r in rows])
+        try:
+            add = ['## 历史表现（回填）', '',
+                   '> 本段为**事后回填**（该记录发布时尚未实现跟踪），'
+                   '数据源为库内日线，非当日原文；正文与提交历史均可核对。', '']
+            add += perf_lines(date, rows, bars, tdays,
+                              title='### 逐日涨幅（自推荐日起）')
+            add += trade_lines(date, rows, bars, tdays, rules,
+                               title='### 模拟交易（次日开盘买入 → 逐日判定卖出）')
+            if len(add) <= 4:
+                continue
+            open(p, 'w', encoding='utf-8').write(
+                body.rstrip() + '\n\n' + '\n'.join(add) + '\n')
+            log(f'{date} 已回填历史表现（{len(rows)} 只）')
+            n += 1
+        except Exception as e:                                # noqa: BLE001
+            log(f'{date} ⚠️ 回填失败：{e}')
     return n
 
 
