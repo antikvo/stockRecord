@@ -323,6 +323,67 @@ def rebuild_index() -> None:
         log(f'README 索引已重建（{len(recs)} 条记录）')
 
 
+def rebuild_perf(days: int = 5) -> None:
+    """重建 README 里 <!-- PERF:BEGIN --> ... <!-- PERF:END --> 的「近 N 日推荐表现」。
+
+    直接解析 records/ 里的记录文件取推荐名单（不依赖 CSV 是否还在），
+    再用库内K线从推荐日算起。跟踪窗口到 T+N 为止。
+    """
+    import re
+    readme = os.path.join(ROOT, 'README.md')
+    if not os.path.exists(readme):
+        return
+    txt = open(readme, encoding='utf-8').read()
+    if '<!-- PERF:BEGIN -->' not in txt or '<!-- PERF:END -->' not in txt:
+        return
+
+    trade_days = market_trade_days()
+    recent = trade_days[-days:] if len(trade_days) >= days else trade_days
+    blocks, all_codes = [], set()
+    parsed = []
+    for d_iso in reversed(recent):                       # 新的在前
+        date = d_iso.replace('-', '')
+        p = os.path.join(ROOT, 'records', date[:4], date[4:6], f'{date[6:8]}.md')
+        if not os.path.exists(p):
+            continue
+        body = open(p, encoding='utf-8').read()
+        sec = body.split('## 推荐股票')[-1].split('## 买卖参考')[0]
+        rows = [(m.group(1), m.group(2).strip()) for m in
+                re.finditer(r'^\|\s*(\d{6})\s*\|\s*([^|]+?)\s*\|', sec, re.M)]
+        if not rows:
+            continue
+        parsed.append((date, rows))
+        all_codes |= {c for c, _ in rows}
+
+    if not parsed:
+        return
+    bars = read_bars(sorted(all_codes))
+
+    L = ['<!-- PERF:BEGIN -->', '',
+         f'> 近 {len(recent)} 个交易日（`{recent[0]}` ~ `{recent[-1]}`）的推荐表现。',
+         '> 基准两个都给：**推荐日收盘**与**次日开盘**（策略实际可买到的价格）。',
+         '> 跟踪到 T+5，之后不再变动。', '']
+    for date, rows in parsed:
+        perf = perf_for(date, rows, bars, trade_days)
+        if not perf:
+            continue
+        iso = f'{date[:4]}-{date[4:6]}-{date[6:8]}'
+        L += [f'### {iso}（{len(perf)} 只）', '',
+              '| 代码 | 名称 | 推荐日收盘 | 次日开盘 | 最新收盘 | 自推荐日 | 自次日开盘 | 数据截至 |',
+              '|---|---|---|---|---|---|---|---|']
+        for (code, name, bc, no_, ld, lc, r1, r2, _mg) in perf:
+            L.append(f'| {code} | {name} | {bc:g} | {no_:g} | {lc:g} '
+                     f'| {_pct(r1)} | {_pct(r2)} | {ld} |')
+        L.append('')
+    L.append('<!-- PERF:END -->')
+
+    new = re.sub(r'<!-- PERF:BEGIN -->.*?<!-- PERF:END -->',
+                 '\n'.join(L), txt, flags=re.S)
+    if new != txt:
+        open(readme, 'w', encoding='utf-8').write(new)
+        log(f'README 近{len(recent)}日表现已重建（{len(parsed)} 个推荐日）')
+
+
 def archive_one(date: str, do_push: bool, do_encrypt: bool,
                 force: bool = False) -> str:
     """归档单个日期。返回 'ok' / 'skip' / 'nofile'。"""
@@ -445,6 +506,7 @@ def main() -> int:
     results = [archive_one(d, not args.no_push, args.encrypt, args.force)
                for d in dates]
     rebuild_index()
+    rebuild_perf()
     # 索引与脚本自身也要入库（记录无变更时，这些仍可能有改动）
     git('add', '-A', 'README.md', 'scripts', '.gitignore', check=False)
     if git('diff', '--cached', '--name-only', check=False).stdout.strip():
