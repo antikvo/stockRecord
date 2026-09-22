@@ -132,12 +132,15 @@ def refresh_tracked(codes: list) -> None:
 
 
 def perf_for(date: str, rows: list, bars: dict, trade_days: list) -> list:
-    """计算某日推荐股票自推荐日起的表现。
+    """计算某日推荐股票自推荐日起的逐日表现。
 
-    rows: [(code, name), ...]
-    返回 [(code, name, base_close, next_open, last_date, last_close,
-            ret_from_rec, ret_from_open, max_gain), ...]
-    基准两个都给：推荐日收盘（用户口径）+ 次日开盘（策略实际可买到的价格）。
+    按交易日推进：推荐日记为第 1 日。
+      推荐日收盘 = 第1日收盘   ← 推荐口径
+      次日开盘   = 第2日开盘   ← 策略实际可买到的价格
+      第三日/第四日/第五日 = 第3/4/5日收盘
+      最新收盘   = 窗口内最后一根可用收盘（最多到第 6 日 = T+5）
+    返回 [{'code','name','t0','t1_open','t2','t3','t4','last_date','last',
+            'ret_rec','ret_open'}, ...]
     """
     if not rows:
         return []
@@ -146,29 +149,40 @@ def perf_for(date: str, rows: list, bars: dict, trade_days: list) -> list:
     if d_iso not in trade_days:
         return []
     i = trade_days.index(d_iso)
-    window = trade_days[i:i + 1 + TRACK_DAYS]      # 推荐日 + 之后 5 个交易日
-    nxt = trade_days[i + 1] if i + 1 < len(trade_days) else None
+    w = trade_days[i:i + 1 + TRACK_DAYS]        # 第1日 .. 第6日（T+5）
     out = []
     for code, name in rows:
         b = bars.get(code) or {}
-        base = b.get(d_iso)
-        if not base or not base[1]:
+
+        def close_of(k):
+            d = w[k] if k < len(w) else None
+            v = b.get(d) if d else None
+            return float(v[1]) if v and v[1] else None
+
+        def open_of(k):
+            d = w[k] if k < len(w) else None
+            v = b.get(d) if d else None
+            return float(v[0]) if v and v[0] else None
+
+        t0 = close_of(0)
+        if t0 is None:
             continue
-        base_close = float(base[1])
-        next_open = float(b[nxt][0]) if nxt and b.get(nxt) and b[nxt][0] else None
-        last_date, last_close, peak = None, None, base_close
-        for d in window:
-            v = b.get(d)
-            if not v:
-                continue
-            last_date, last_close = d, float(v[1])
-            peak = max(peak, float(v[2]) if v[2] else float(v[1]))
-        if last_close is None:
+        t1_open = open_of(1)
+        last_date, last = None, None
+        for k in range(len(w)):
+            c = close_of(k)
+            if c is not None:
+                last_date, last = w[k], c
+        if last is None:
             continue
-        out.append((code, name, base_close, next_open, last_date, last_close,
-                    (last_close / base_close - 1) * 100,
-                    ((last_close / next_open - 1) * 100) if next_open else None,
-                    (peak / base_close - 1) * 100))
+        out.append({
+            'code': code, 'name': name,
+            't0': t0, 't1_open': t1_open,
+            't2': close_of(2), 't3': close_of(3), 't4': close_of(4),
+            'last_date': last_date, 'last': last,
+            'ret_rec': (last / t0 - 1) * 100,
+            'ret_open': ((last / t1_open - 1) * 100) if t1_open else None,
+        })
     return out
 
 
@@ -176,21 +190,35 @@ def _pct(v):
     return '—' if v is None else f'{v:+.2f}%'
 
 
+def _num(v):
+    return '—' if v is None else f'{v:g}'
+
+
+PERF_HEADER = ('| 代码 | 名称 | 推荐日收盘 | 次日开盘 | 第三日 | 第四日 '
+               '| 第五日 | 最新收盘 | 自推荐日 | 自次日开盘 | 数据截至 |')
+PERF_SEP = '|' + '---|' * 11
+
+
+def perf_row_lines(perf: list) -> list:
+    return [f"| {p['code']} | {p['name']} | {_num(p['t0'])} "
+            f"| {_num(p['t1_open'])} | {_num(p['t2'])} | {_num(p['t3'])} "
+            f"| {_num(p['t4'])} | {_num(p['last'])} "
+            f"| {_pct(p['ret_rec'])} | {_pct(p['ret_open'])} "
+            f"| {p['last_date']} |" for p in perf]
+
+
 def perf_lines(date: str, rows: list, bars: dict, trade_days: list) -> list:
     """生成单条记录的「后续表现」markdown。"""
     perf = perf_for(date, rows, bars, trade_days)
     if not perf:
         return []
-    last = max(p[4] for p in perf)
-    L = ['## 后续表现（自推荐日起，T+5 冻结）', '',
-         f'> 基准两个都给：**推荐日收盘**（推荐口径）与**次日开盘**'
-         f'（策略实际可买到的价格，更接近真实成交）。',
-         f'> 数据截至 `{last}`。', '',
-         '| 代码 | 名称 | 推荐日收盘 | 次日开盘 | 最新收盘 | 自推荐日 | 自次日开盘 | 区间最高 |',
-         '|---|---|---|---|---|---|---|---|']
-    for (code, name, bc, no_, ld, lc, r1, r2, mg) in perf:
-        L.append(f'| {code} | {name} | {bc:g} | {no_:g} | {lc:g} '
-                 f'| {_pct(r1)} | {_pct(r2)} | {_pct(mg)} |')
+    last = max(p['last_date'] for p in perf)
+    L = ['## 后续表现（自推荐日起，逐日推进）', '',
+         '> 按交易日推进：推荐日记为**第 1 日**，次日开盘 = 第 2 日开盘'
+         '（策略实际可买到的价格）。',
+         f'> 数据截至 `{last}`；第 6 日（T+5）后不再变动。', '',
+         PERF_HEADER, PERF_SEP]
+    L += perf_row_lines(perf)
     L.append('')
     return L
 
@@ -367,19 +395,16 @@ def rebuild_perf(days: int = 5) -> None:
 
     L = ['<!-- PERF:BEGIN -->', '',
          f'> 近 {len(recent)} 个交易日（`{recent[0]}` ~ `{recent[-1]}`）的推荐表现。',
-         '> 基准两个都给：**推荐日收盘**与**次日开盘**（策略实际可买到的价格）。',
-         '> 跟踪到 T+5，之后不再变动。', '']
+         '> 逐日推进：推荐日记为**第 1 日**，次日开盘 = 第 2 日开盘'
+         '（策略实际可买到的价格）。',
+         '> 跟踪到第 6 日（T+5），之后不再变动。', '']
     for date, rows in parsed:
         perf = perf_for(date, rows, bars, trade_days)
         if not perf:
             continue
         iso = f'{date[:4]}-{date[4:6]}-{date[6:8]}'
-        L += [f'### {iso}（{len(perf)} 只）', '',
-              '| 代码 | 名称 | 推荐日收盘 | 次日开盘 | 最新收盘 | 自推荐日 | 自次日开盘 | 数据截至 |',
-              '|---|---|---|---|---|---|---|---|']
-        for (code, name, bc, no_, ld, lc, r1, r2, _mg) in perf:
-            L.append(f'| {code} | {name} | {bc:g} | {no_:g} | {lc:g} '
-                     f'| {_pct(r1)} | {_pct(r2)} | {ld} |')
+        L += [f'### {iso}（{len(perf)} 只）', '', PERF_HEADER, PERF_SEP]
+        L += perf_row_lines(perf)
         L.append('')
     L.append('<!-- PERF:END -->')
 
