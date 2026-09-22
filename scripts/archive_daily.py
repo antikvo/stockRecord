@@ -821,8 +821,9 @@ def main() -> int:
     rebuild_perf()
     if args.backfill_history:
         log(f'历史回填：{backfill_history()} 条记录已补上表现段落')
-    # 索引与脚本自身也要入库（记录无变更时，这些仍可能有改动）
-    git('add', '-A', 'README.md', 'scripts', '.gitignore', check=False)
+    # 索引、脚本自身、以及回填产生的记录都要入库
+    git('add', '-A', 'README.md', 'scripts', '.gitignore', 'records',
+        'encrypted', check=False)
     if git('diff', '--cached', '--name-only', check=False).stdout.strip():
         git('commit', '-m', 'chore: 同步归档脚本与记录索引', check=False)
     if not args.no_push:
