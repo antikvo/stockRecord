@@ -770,6 +770,8 @@ def main() -> int:
                     help='补历史区间 YYYYMMDD YYYYMMDD')
     ap.add_argument('--backfill-history', action='store_true',
                     help='给还没有表现段落的老记录补「历史表现（回填）」（幂等）')
+    ap.add_argument('--image', action='store_true',
+                    help='同时生成当日图片（public 合规版，不含个股）')
     ap.add_argument('--encrypt', action='store_true',
                     help='额外生成加密版（原方案：次日公布口令）')
     ap.add_argument('--no-push', action='store_true', help='只提交不推送')
@@ -821,6 +823,13 @@ def main() -> int:
     rebuild_perf()
     if args.backfill_history:
         log(f'历史回填：{backfill_history()} 条记录已补上表现段落')
+    if args.image:
+        try:
+            import make_image
+            for d in dates:
+                make_image.one(d, 'public')
+        except Exception as e:                                # noqa: BLE001
+            log(f'⚠️ 出图失败（不影响归档）：{e}')
     # 索引、脚本自身、以及回填产生的记录都要入库
     git('add', '-A', 'README.md', 'scripts', '.gitignore', 'records',
         'encrypted', check=False)
