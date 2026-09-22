@@ -99,16 +99,17 @@ def market_trade_days() -> list:
 
 
 def read_bars(codes: list) -> dict:
-    """读取指定股票的开收盘：{code: {date: (open, close, high)}}。"""
+    """读取指定股票的日线：{code: {date: {open, close, high, low}}}。"""
     out = {}
     if not codes:
         return out
     marks = ','.join('?' * len(codes))
     with _connect() as con:
-        for code, d, o, c, h in con.execute(
-                f"SELECT symbol, date, open, close, high FROM bars "
+        for code, d, o, c, h, lo in con.execute(
+                f"SELECT symbol, date, open, close, high, low FROM bars "
                 f"WHERE symbol IN ({marks})", list(codes)):
-            out.setdefault(code, {})[d] = (o, c, h)
+            out.setdefault(code, {})[d] = {'open': o, 'close': c,
+                                           'high': h, 'low': lo}
     return out
 
 
@@ -151,18 +152,21 @@ def perf_for(date: str, rows: list, bars: dict, trade_days: list) -> list:
     i = trade_days.index(d_iso)
     w = trade_days[i:i + 1 + TRACK_DAYS]        # 第1日 .. 第6日（T+5）
     out = []
-    for code, name in rows:
+    for _row in rows:
+        # rows 既支持 dict（新）也兼容 (code, name) 元组（旧调用）
+        code = _row['code'] if isinstance(_row, dict) else _row[0]
+        name = _row['name'] if isinstance(_row, dict) else _row[1]
         b = bars.get(code) or {}
 
         def close_of(k):
             d = w[k] if k < len(w) else None
             v = b.get(d) if d else None
-            return float(v[1]) if v and v[1] else None
+            return float(v['close']) if v and v.get('close') else None
 
         def open_of(k):
             d = w[k] if k < len(w) else None
             v = b.get(d) if d else None
-            return float(v[0]) if v and v[0] else None
+            return float(v['open']) if v and v.get('open') else None
 
         t0 = close_of(0)
         if t0 is None:
@@ -199,6 +203,144 @@ PERF_HEADER = ('| 代码 | 名称 | 推荐日收盘 | 次日开盘 | 第三日 |
 PERF_SEP = '|' + '---|' * 11
 
 
+# ---- 模拟交易参数：直接读 trade_advisor 的配置，保持与实盘一致 ----
+def load_exit_rules() -> dict:
+    rules = {'hold_days_exit': 5, 'take_profit_pct': 6.0}
+    try:
+        import yaml
+        p = os.path.join(ROOT, '..', 'trade_advisor', 'config.yaml')
+        cfg = yaml.safe_load(open(p, encoding='utf-8'))['portfolio']
+        rules['hold_days_exit'] = int(cfg.get('hold_days_exit', 5))
+        rules['take_profit_pct'] = float(cfg.get('take_profit_pct', 6.0))
+    except Exception as e:                                    # noqa: BLE001
+        log(f'⚠️ 读取 trade_advisor 离场参数失败，用默认值：{e}')
+    return rules
+
+
+def simulate_trade(date: str, row: dict, bars: dict, trade_days: list,
+                   rules: dict) -> dict:
+    """模拟「次日开盘买入 → 逐日判定卖出」。
+
+    规则照抄 trade_advisor/src/advisor.py 的 opencheck：
+      1. 买入日盘中低点 ≤ 止损位 → 撤单（不成交）
+      2. 买入后每个交易日按优先级判定：破止损 > 满 N 日了结 > 触压力+浮盈≥6% 止盈
+      3. 买入当日不参与评估（advisor.py:511 的「当日新仓」修复）
+
+    行情只有日线，判定按「最差情况」取价（保守，不美化结果）：
+      止损 → 开盘已破则按开盘价，否则按止损价
+      止盈 → 开盘已过压力则按开盘价，否则按压力价
+    返回 {status, buy_date, buy_price, sell_date, sell_price, held_days,
+          reason, ret_pct, trace:[...]}
+    """
+    if not row or date not in [d.replace('-', '') for d in trade_days]:
+        return {}
+    d_iso = f'{date[:4]}-{date[4:6]}-{date[6:8]}'
+    i = trade_days.index(d_iso)
+    b = bars.get(row['code']) or {}
+    stop, press = row.get('stop'), row.get('press')
+    hold_n = int(rules['hold_days_exit'])
+    tp = float(rules['take_profit_pct'])
+
+    # 买入日 = 次日（第 2 日）
+    if i + 1 >= len(trade_days):
+        return {'status': '待买入', 'reason': '次日行情尚未产生'}
+    buy_d = trade_days[i + 1]
+    bd = b.get(buy_d)
+    if not bd or not bd.get('open'):
+        return {'status': '无行情', 'reason': f'{buy_d} 无K线'}
+    buy_price = float(bd['open'])
+    # 买入日盘中破止损 → 撤单
+    if (stop is not None and bd.get('low') is not None
+            and float(bd['low']) <= float(stop)):
+        return {'status': '撤单', 'buy_date': buy_d, 'buy_price': buy_price,
+                'reason': f"买入日盘中低点{float(bd['low']):g}破止损{stop:g}，放弃",
+                'ret_pct': 0.0, 'trace': []}
+
+    trace, sell = [], None
+    last_eval = min(i + 1 + hold_n, len(trade_days) - 1)
+    for k in range(i + 2, last_eval + 1):          # 买入日次日起评估
+        d = trade_days[k]
+        v = b.get(d)
+        if not v:
+            continue
+        o, c, h, lo = (v.get('open'), v.get('close'), v.get('high'),
+                       v.get('low'))
+        held = k - (i + 1)                          # 已持有交易日数（买入日=0）
+        rec = {'date': d, 'open': o, 'low': lo, 'high': h, 'close': c,
+               'held': held}
+        if stop is not None and lo is not None and float(lo) <= float(stop):
+            px = float(o) if (o and float(o) <= float(stop)) else float(stop)
+            sell = (d, px, f'破止损{stop:g}', held)
+        elif held >= hold_n:
+            sell = (d, float(c), f'持仓满{hold_n}个交易日了结', held)
+        elif (press is not None and h is not None and float(h) >= float(press)
+              and (float(press) / buy_price - 1) * 100 >= tp):
+            px = float(o) if (o and float(o) >= float(press)) else float(press)
+            sell = (d, px, f'触压力{press:g}且浮盈≥{tp:g}%，止盈', held)
+        rec['note'] = sell[2] if sell else '持有'
+        trace.append(rec)
+        if sell:
+            break
+
+    if not sell:
+        return {'status': '持有中', 'buy_date': buy_d, 'buy_price': buy_price,
+                'reason': f'未触发离场（跟踪 {hold_n} 个交易日）',
+                'ret_pct': None, 'trace': trace}
+    d, px, why, held = sell
+    return {'status': '已了结', 'buy_date': buy_d, 'buy_price': buy_price,
+            'sell_date': d, 'sell_price': px, 'held_days': held, 'reason': why,
+            'ret_pct': (px / buy_price - 1) * 100, 'trace': trace}
+
+
+TRADE_HEADER = ('| 代码 | 名称 | 买入日 | 买入价 | 卖出日 | 卖出价 '
+                '| 持有(交易日) | 卖出原因 | 收益率 |')
+TRADE_SEP = '|' + '---|' * 9
+
+
+def trade_lines(date: str, rows: list, bars: dict, trade_days: list,
+                rules: dict) -> list:
+    """生成「模拟交易」段落：总结表 + 逐日判定明细（可折叠）。"""
+    sims = [(r, simulate_trade(date, r, bars, trade_days, rules)) for r in rows]
+    sims = [(r, s) for r, s in sims if s]
+    if not sims:
+        return []
+    L = ['## 模拟交易（次日开盘买入 → 逐日判定卖出）', '',
+         f'> 规则取自 `trade_advisor/config.yaml`：**破止损 → 卖出**；'
+         f'**满 {rules["hold_days_exit"]} 个交易日 → 了结**；'
+         f'**触及压力位且浮盈 ≥{rules["take_profit_pct"]:g}% → 止盈**。',
+         '> 判定优先级：破止损 > 满N日了结 > 止盈（与实盘 `opencheck` 一致）；'
+         '买入当日不参与评估。',
+         '> 只有日线数据，触发时按**最差情况**取价（开盘已破按开盘价，否则按触发价），'
+         '不美化结果；买入日盘中破止损则撤单不成交。', '',
+         TRADE_HEADER, TRADE_SEP]
+    for r, s in sims:
+        st = s['status']
+        if st == '已了结':
+            L.append(f"| {r['code']} | {r['name']} | {s['buy_date']} "
+                     f"| {s['buy_price']:g} | {s['sell_date']} | {s['sell_price']:g} "
+                     f"| {s['held_days']} | {s['reason']} "
+                     f"| {_pct(s['ret_pct'])} |")
+        else:
+            L.append(f"| {r['code']} | {r['name']} | {s.get('buy_date', '—')} "
+                     f"| {_num(s.get('buy_price'))} | — | — | — "
+                     f"| {s.get('reason', st)} | — |")
+    L.append('')
+
+    det = [(r, s) for r, s in sims if s.get('trace')]
+    if det:
+        L += ['<details>', '<summary>逐日判定明细</summary>', '',
+              '| 日期 | 代码 | 名称 | 开盘 | 最低 | 最高 | 收盘 '
+              '| 已持有 | 判定 |', '|' + '---|' * 9]
+        for r, s in det:
+            for t in s['trace']:
+                L.append(f"| {t['date']} | {r['code']} | {r['name']} "
+                         f"| {_num(t['open'])} | {_num(t['low'])} "
+                         f"| {_num(t['high'])} | {_num(t['close'])} "
+                         f"| {t['held']} | {t['note']} |")
+        L += ['', '</details>', '']
+    return L
+
+
 def perf_row_lines(perf: list) -> list:
     return [f"| {p['code']} | {p['name']} | {_num(p['t0'])} "
             f"| {_num(p['t1_open'])} | {_num(p['t2'])} | {_num(p['t3'])} "
@@ -224,7 +366,8 @@ def perf_lines(date: str, rows: list, bars: dict, trade_days: list) -> list:
 
 
 def build_record(date: str, df: pd.DataFrame, env: dict | None,
-                 perf_md: list | None = None) -> str:
+                 perf_md: list | None = None,
+                 trade_md: list | None = None) -> str:
     """生成明文 markdown 记录（格式对齐历史 records/ 文件）。"""
     date_iso = f'{date[:4]}-{date[4:6]}-{date[6:8]}'
     rec = df[df.get('推荐') == '推荐'].copy() if '推荐' in df.columns else df.iloc[0:0]
@@ -290,6 +433,8 @@ def build_record(date: str, df: pd.DataFrame, env: dict | None,
 
     if perf_md:
         L += perf_md
+    if trade_md:
+        L += trade_md
     L += ['---', '',
           f'> 完整数据：`reports/v2_candidates_{date}.csv`',
           '> ⚠️ 学习用途，非投资建议。', '']
@@ -357,11 +502,45 @@ def rebuild_index() -> None:
         log(f'README 索引已重建（{len(recs)} 条记录）')
 
 
+def parse_rec_table(sec: str) -> list:
+    """解析记录里的「推荐股票」表格 → [{'code','name','stop','press'}]。
+
+    按表头定位列，避免列序变动导致取错（止损位/压力位是模拟交易必需的）。
+    """
+    import re
+    lines = [l for l in sec.splitlines() if l.strip().startswith('|')]
+    if len(lines) < 2:
+        return []
+    hdr = [c.strip() for c in lines[0].strip().strip('|').split('|')]
+    idx = {c: i for i, c in enumerate(hdr)}
+    if '代码' not in idx or '名称' not in idx:
+        return []
+    out = []
+    for l in lines[2:]:
+        cells = [c.strip() for c in l.strip().strip('|').split('|')]
+        if len(cells) < len(hdr):
+            continue
+        code = cells[idx['代码']]
+        if not re.fullmatch(r'\d{6}', code):
+            continue
+
+        def num(col):
+            v = cells[idx[col]] if col in idx else ''
+            try:
+                return float(v)
+            except Exception:
+                return None
+
+        out.append({'code': code, 'name': cells[idx['名称']],
+                    'stop': num('止损位'), 'press': num('压力位')})
+    return out
+
+
 def rebuild_perf(days: int = 5) -> None:
     """重建 README 里 <!-- PERF:BEGIN --> ... <!-- PERF:END --> 的「近 N 日推荐表现」。
 
     直接解析 records/ 里的记录文件取推荐名单（不依赖 CSV 是否还在），
-    再用库内K线从推荐日算起。跟踪窗口到 T+N 为止。
+    再用库内K线从推荐日算起：逐日涨幅 + 模拟交易（次日买入、逐日判定卖出）。
     """
     import re
     readme = os.path.join(ROOT, 'README.md')
@@ -373,8 +552,7 @@ def rebuild_perf(days: int = 5) -> None:
 
     trade_days = market_trade_days()
     recent = trade_days[-days:] if len(trade_days) >= days else trade_days
-    blocks, all_codes = [], set()
-    parsed = []
+    all_codes, parsed = set(), []
     for d_iso in reversed(recent):                       # 新的在前
         date = d_iso.replace('-', '')
         p = os.path.join(ROOT, 'records', date[:4], date[4:6], f'{date[6:8]}.md')
@@ -382,30 +560,50 @@ def rebuild_perf(days: int = 5) -> None:
             continue
         body = open(p, encoding='utf-8').read()
         sec = body.split('## 推荐股票')[-1].split('## 买卖参考')[0]
-        rows = [(m.group(1), m.group(2).strip()) for m in
-                re.finditer(r'^\|\s*(\d{6})\s*\|\s*([^|]+?)\s*\|', sec, re.M)]
+        rows = parse_rec_table(sec)
         if not rows:
             continue
         parsed.append((date, rows))
-        all_codes |= {c for c, _ in rows}
+        all_codes |= {r['code'] for r in rows}
 
     if not parsed:
         return
     bars = read_bars(sorted(all_codes))
+    rules = load_exit_rules()
 
     L = ['<!-- PERF:BEGIN -->', '',
          f'> 近 {len(recent)} 个交易日（`{recent[0]}` ~ `{recent[-1]}`）的推荐表现。',
          '> 逐日推进：推荐日记为**第 1 日**，次日开盘 = 第 2 日开盘'
          '（策略实际可买到的价格）。',
-         '> 跟踪到第 6 日（T+5），之后不再变动。', '']
+         f'> 模拟交易规则取自 `trade_advisor/config.yaml`：破止损 → 卖出；'
+         f'满 {rules["hold_days_exit"]} 个交易日 → 了结；'
+         f'触及压力位且浮盈 ≥{rules["take_profit_pct"]:g}% → 止盈。', '']
     for date, rows in parsed:
-        perf = perf_for(date, rows, bars, trade_days)
-        if not perf:
-            continue
         iso = f'{date[:4]}-{date[4:6]}-{date[6:8]}'
-        L += [f'### {iso}（{len(perf)} 只）', '', PERF_HEADER, PERF_SEP]
-        L += perf_row_lines(perf)
-        L.append('')
+        perf = perf_for(date, rows, bars, trade_days)
+        if perf:
+            L += [f'### {iso}（{len(perf)} 只）', '', PERF_HEADER, PERF_SEP]
+            L += perf_row_lines(perf)
+            L.append('')
+        sims = [(r, simulate_trade(date, r, bars, trade_days, rules))
+                for r in rows]
+        sims = [(r, s) for r, s in sims if s]
+        if sims:
+            L += ['**模拟交易**（次日开盘买入 → 逐日判定卖出）', '',
+                  TRADE_HEADER, TRADE_SEP]
+            for r, s in sims:
+                if s['status'] == '已了结':
+                    L.append(
+                        f"| {r['code']} | {r['name']} | {s['buy_date']} "
+                        f"| {s['buy_price']:g} | {s['sell_date']} "
+                        f"| {s['sell_price']:g} | {s['held_days']} "
+                        f"| {s['reason']} | {_pct(s['ret_pct'])} |")
+                else:
+                    L.append(
+                        f"| {r['code']} | {r['name']} | {s.get('buy_date', '—')} "
+                        f"| {_num(s.get('buy_price'))} | — | — | — "
+                        f"| {s.get('reason', s['status'])} | — |")
+            L.append('')
     L.append('<!-- PERF:END -->')
 
     new = re.sub(r'<!-- PERF:BEGIN -->.*?<!-- PERF:END -->',
@@ -436,17 +634,30 @@ def archive_one(date: str, do_push: bool, do_encrypt: bool,
     os.makedirs(outdir, exist_ok=True)
     outpath = os.path.join(outdir, f'{date[6:8]}.md')
 
-    # 推荐股后续表现（自推荐日起算，T+5 冻结）
-    perf_md = []
+    # 推荐股后续表现 + 模拟交易（自推荐日起算，T+5 冻结）
+    perf_md, trade_md = [], []
     if '推荐' in df.columns and '代码' in df.columns:
         rec_df = df[df['推荐'] == '推荐']
         if len(rec_df):
-            rows = [(str(r['代码']).zfill(6), str(r.get('名称', '')))
+            def _fnum(v):
+                try:
+                    return float(v)
+                except Exception:
+                    return None
+            rows = [{'code': str(r['代码']).zfill(6),
+                     'name': str(r.get('名称', '')),
+                     'stop': _fnum(r.get('止损位')),
+                     'press': _fnum(r.get('压力位'))}
                     for _, r in rec_df.iterrows()]
-            perf_md = perf_lines(date, rows,
-                                 read_bars([c for c, _ in rows]),
-                                 market_trade_days())
-    body = build_record(date, df, env, perf_md)
+            bars = read_bars([r['code'] for r in rows])
+            tdays = market_trade_days()
+            try:
+                perf_md = perf_lines(date, rows, bars, tdays)
+                trade_md = trade_lines(date, rows, bars, tdays, load_exit_rules())
+            except Exception as e:                            # noqa: BLE001
+                log(f'{date} ⚠️ 表现/模拟交易计算失败（记录仍会归档）：{e}')
+                perf_md, trade_md = [], []
+    body = build_record(date, df, env, perf_md, trade_md)
 
     changed = True
     if os.path.exists(outpath) and not force:
@@ -534,8 +745,15 @@ def main() -> int:
             pass
     refresh_tracked(sorted(tracked))
 
-    results = [archive_one(d, not args.no_push, args.encrypt, args.force)
-               for d in dates]
+    def _one(d):
+        # 单个日期出错不应中断整轮归档
+        try:
+            return archive_one(d, not args.no_push, args.encrypt, args.force)
+        except Exception as e:                                # noqa: BLE001
+            log(f'{d} ❌ 归档失败：{e}')
+            return 'error'
+
+    results = [_one(d) for d in dates]
     rebuild_index()
     rebuild_perf()
     # 索引与脚本自身也要入库（记录无变更时，这些仍可能有改动）
