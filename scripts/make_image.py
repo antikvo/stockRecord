@@ -115,6 +115,19 @@ def render_html(date: str, profile: str, df: pd.DataFrame, env: dict,
     stage_html = '　'.join(
         f'<span class="chip">{esc(k)} <b>{v}</b></span>' for k, v in stages)
 
+    # 行业分布：只做聚合统计（≥2 只才列），不指向任何个股。
+    # 刻意不提供「首字 + 收盘价 + 行业」这类可反查到具体标的的组合。
+    ind_html = ''
+    if '行业' in df.columns:
+        vc = df['行业'].value_counts()
+        vc = vc[vc >= 2].head(8)
+        if len(vc):
+            ind_html = ('<div class="sec">候选池行业分布'
+                        '<span class="warn">聚合统计 · 不指向个股</span></div>'
+                        '<div class="chips">' + ''.join(
+                            f'<span class="chip">{esc(k)} <b>{v}</b></span>'
+                            for k, v in vc.items()) + '</div>')
+
     rec_n = 0
     if '推荐' in df.columns:
         rec_n = int((df['推荐'] == '推荐').sum())
@@ -228,6 +241,7 @@ def render_html(date: str, profile: str, df: pd.DataFrame, env: dict,
     <span class="chip">介入信号 <b>{rec_n}</b> 只</span>
   </div>
   <div class="chips">{stage_html}</div>
+  {ind_html}
 
   <div class="sec">累计模拟战绩</div>
   {stats_html}
