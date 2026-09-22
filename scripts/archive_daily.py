@@ -298,13 +298,14 @@ TRADE_SEP = '|' + '---|' * 9
 
 
 def trade_lines(date: str, rows: list, bars: dict, trade_days: list,
-                rules: dict) -> list:
+                rules: dict,
+                title: str = '## 模拟交易（次日开盘买入 → 逐日判定卖出）') -> list:
     """生成「模拟交易」段落：总结表 + 逐日判定明细（可折叠）。"""
     sims = [(r, simulate_trade(date, r, bars, trade_days, rules)) for r in rows]
     sims = [(r, s) for r, s in sims if s]
     if not sims:
         return []
-    L = ['## 模拟交易（次日开盘买入 → 逐日判定卖出）', '',
+    L = [title, '',
          f'> 规则取自 `trade_advisor/config.yaml`：**破止损 → 卖出**；'
          f'**满 {rules["hold_days_exit"]} 个交易日 → 了结**；'
          f'**触及压力位且浮盈 ≥{rules["take_profit_pct"]:g}% → 止盈**。',
@@ -349,13 +350,14 @@ def perf_row_lines(perf: list) -> list:
             f"| {p['last_date']} |" for p in perf]
 
 
-def perf_lines(date: str, rows: list, bars: dict, trade_days: list) -> list:
+def perf_lines(date: str, rows: list, bars: dict, trade_days: list,
+               title: str = '## 后续表现（自推荐日起，逐日推进）') -> list:
     """生成单条记录的「后续表现」markdown。"""
     perf = perf_for(date, rows, bars, trade_days)
     if not perf:
         return []
     last = max(p['last_date'] for p in perf)
-    L = ['## 后续表现（自推荐日起，逐日推进）', '',
+    L = [title, '',
          '> 按交易日推进：推荐日记为**第 1 日**，次日开盘 = 第 2 日开盘'
          '（策略实际可买到的价格）。',
          f'> 数据截至 `{last}`；第 6 日（T+5）后不再变动。', '',
@@ -613,6 +615,55 @@ def rebuild_perf(days: int = 5) -> None:
         log(f'README 近{len(recent)}日表现已重建（{len(parsed)} 个推荐日）')
 
 
+def backfill_history() -> int:
+    """给还没有表现段落的历史记录补上「历史表现（回填）」。
+
+    老记录的 CSV 多半已不在，所以直接从记录文件本身解析推荐名单
+    （含止损位/压力位）再用库内K线计算。这些日期的 T+5 早已走完、
+    结果已冻结，回填一次就不会再变。已含段落的文件自动跳过（幂等）。
+    """
+    import re
+    n = 0
+    tdays = market_trade_days()
+    rules = load_exit_rules()
+    for dirpath, _, files in sorted(os.walk(os.path.join(ROOT, 'records'))):
+        for fn in sorted(files):
+            if not fn.endswith('.md'):
+                continue
+            p = os.path.join(dirpath, fn)
+            rel = os.path.relpath(p, ROOT).replace(os.sep, '/')
+            parts = rel.split('/')
+            if len(parts) != 4:
+                continue
+            date = f'{parts[1]}{parts[2]}{fn[:2]}'
+            body = open(p, encoding='utf-8').read()
+            if '## 后续表现' in body or '## 历史表现' in body:
+                continue
+            sec = body.split('## 推荐股票')[-1].split('## 买卖参考')[0]
+            rows = parse_rec_table(sec)
+            if not rows:
+                continue
+            codes = [r['code'] for r in rows]
+            bars = read_bars(codes)
+            try:
+                add = ['## 历史表现（回填）', '',
+                       '> 本段为**事后回填**（该记录发布时尚未实现跟踪），'
+                       '数据源为库内日线，非当日原文；正文与提交历史均可核对。', '']
+                add += perf_lines(date, rows, bars, tdays,
+                                  title='### 逐日涨幅（自推荐日起）')
+                add += trade_lines(date, rows, bars, tdays, rules,
+                                   title='### 模拟交易（次日开盘买入 → 逐日判定卖出）')
+                if len(add) <= 4:
+                    continue
+                open(p, 'w', encoding='utf-8').write(
+                    body.rstrip() + '\n\n' + '\n'.join(add) + '\n')
+                log(f'{date} 已回填历史表现（{len(rows)} 只）')
+                n += 1
+            except Exception as e:                            # noqa: BLE001
+                log(f'{date} ⚠️ 回填失败：{e}')
+    return n
+
+
 def archive_one(date: str, do_push: bool, do_encrypt: bool,
                 force: bool = False) -> str:
     """归档单个日期。返回 'ok' / 'skip' / 'nofile'。"""
@@ -707,6 +758,8 @@ def main() -> int:
     ap.add_argument('--date', default=None, help='YYYYMMDD，默认今天')
     ap.add_argument('--backfill', nargs=2, metavar=('START', 'END'),
                     help='补历史区间 YYYYMMDD YYYYMMDD')
+    ap.add_argument('--backfill-history', action='store_true',
+                    help='给还没有表现段落的老记录补「历史表现（回填）」（幂等）')
     ap.add_argument('--encrypt', action='store_true',
                     help='额外生成加密版（原方案：次日公布口令）')
     ap.add_argument('--no-push', action='store_true', help='只提交不推送')
@@ -756,6 +809,8 @@ def main() -> int:
     results = [_one(d) for d in dates]
     rebuild_index()
     rebuild_perf()
+    if args.backfill_history:
+        log(f'历史回填：{backfill_history()} 条记录已补上表现段落')
     # 索引与脚本自身也要入库（记录无变更时，这些仍可能有改动）
     git('add', '-A', 'README.md', 'scripts', '.gitignore', check=False)
     if git('diff', '--cached', '--name-only', check=False).stdout.strip():
