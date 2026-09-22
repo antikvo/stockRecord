@@ -346,12 +346,45 @@ def one(date: str, profile: str) -> str | None:
     return None
 
 
+def send_feishu(paths: list) -> int:
+    """把生成的图片发到飞书群/私聊（复用 OpenClaw 已配置的机器人凭证）。"""
+    try:
+        sys.path.insert(0, os.path.join(ROOT, '..', 'screener', 'src'))
+        from feishu_push import (get_tenant_token, load_app_credentials,
+                                 resolve_receive, send_image_to)
+    except Exception as e:                                    # noqa: BLE001
+        print(f'[feishu] 无法加载推送模块：{e}')
+        return 0
+    cred = load_app_credentials()
+    if not cred:
+        print('[feishu] 未找到 appId/appSecret（~/.openclaw/openclaw.json），跳过')
+        return 0
+    rid, rtype = resolve_receive()
+    if not rid:
+        print('[feishu] 未配置接收目标（群 chat_id / 用户 open_id），跳过')
+        return 0
+    token = get_tenant_token(*cred)
+    if not token:
+        print('[feishu] 获取 tenant_access_token 失败')
+        return 0
+    who = (f'群 {rid[:12]}...' if rtype == 'chat_id' else f'open_id {rid[:8]}...')
+    n = 0
+    for p in paths:
+        if p and send_image_to(token, rid, rtype, p):
+            print(f'[feishu] 已发送 {os.path.basename(p)} → {who}')
+            n += 1
+    return n
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument('--date', default=None, help='YYYYMMDD，默认今天')
     ap.add_argument('--profile', choices=['public', 'full'], default='public')
     ap.add_argument('--all-recent', action='store_true',
                     help='近 5 个交易日各出一张')
+    ap.add_argument('--feishu', choices=['public', 'full', 'both'],
+                    default=None,
+                    help='把图片发到飞书（public=合规版 / full=内部版 / both）')
     args = ap.parse_args()
     dates = []
     if args.all_recent:
@@ -359,7 +392,26 @@ def main() -> int:
         dates = [d.replace('-', '') for d in td]
     else:
         dates = [args.date or datetime.now().strftime('%Y%m%d')]
-    ok = sum(1 for d in dates if one(d, args.profile))
+
+    made = [one(d, args.profile) for d in dates]
+    ok = sum(1 for p in made if p)
+
+    if args.feishu:
+        want = {'public': ['public'], 'full': ['full'],
+                'both': ['public', 'full']}[args.feishu]
+        send_paths = []
+        for d in dates:
+            for prof in want:
+                p = os.path.join(OUTDIR, f'{d}-{prof}.png')
+                if not os.path.exists(p):
+                    one(d, prof)
+                if os.path.exists(p):
+                    send_paths.append(p)
+        if send_paths:
+            send_feishu(send_paths)
+        else:
+            print('[feishu] 没有可发送的图片')
+
     print(f'完成：{ok}/{len(dates)} 张 → {OUTDIR}')
     return 0
 
