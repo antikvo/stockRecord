@@ -76,7 +76,117 @@ def fnum(v):
         return ''
 
 
-def build_record(date: str, df: pd.DataFrame, env: dict | None) -> str:
+DB_PATH = os.path.join(ROOT, '..', 'strategy_v2', 'data', 'v2.db')
+TRACK_DAYS = 5          # 推荐后跟踪的交易日数（T+5 后冻结，历史不再变动）
+
+
+def _connect():
+    import sqlite3
+    return sqlite3.connect(DB_PATH)
+
+
+def market_trade_days() -> list:
+    """库内全部交易日（升序）—— 与 v2 扫描同一口径的事实交易日历。"""
+    with _connect() as con:
+        return [d for (d,) in con.execute(
+            "SELECT DISTINCT date FROM bars ORDER BY date")]
+
+
+def read_bars(codes: list) -> dict:
+    """读取指定股票的开收盘：{code: {date: (open, close, high)}}。"""
+    out = {}
+    if not codes:
+        return out
+    marks = ','.join('?' * len(codes))
+    with _connect() as con:
+        for code, d, o, c, h in con.execute(
+                f"SELECT symbol, date, open, close, high FROM bars "
+                f"WHERE symbol IN ({marks})", list(codes)):
+            out.setdefault(code, {})[d] = (o, c, h)
+    return out
+
+
+def refresh_tracked(codes: list) -> None:
+    """尽最大努力把被跟踪个股的K线补到最新（失败不影响归档）。"""
+    if not codes:
+        return
+    try:
+        sys.path.insert(0, os.path.join(ROOT, '..', 'strategy_v2', 'src'))
+        from data import DataStore, backfill_today_from_tencent
+        ds = DataStore()
+        for c in codes:
+            try:
+                ds.fetch_recent(c)
+            except Exception:
+                pass
+        n = backfill_today_from_tencent(sorted(codes))
+        log(f'K线刷新：{len(codes)} 只被跟踪个股，补当日 {n} 只')
+    except Exception as e:                                    # noqa: BLE001
+        log(f'⚠️ 被跟踪个股K线刷新失败（归档继续）：{e}')
+
+
+def perf_for(date: str, rows: list, bars: dict, trade_days: list) -> list:
+    """计算某日推荐股票自推荐日起的表现。
+
+    rows: [(code, name), ...]
+    返回 [(code, name, base_close, next_open, last_date, last_close,
+            ret_from_rec, ret_from_open, max_gain), ...]
+    基准两个都给：推荐日收盘（用户口径）+ 次日开盘（策略实际可买到的价格）。
+    """
+    if not rows or date not in trade_days:
+        return []
+    i = trade_days.index(date)
+    window = trade_days[i:i + 1 + TRACK_DAYS]      # 推荐日 + 之后 5 个交易日
+    nxt = trade_days[i + 1] if i + 1 < len(trade_days) else None
+    out = []
+    for code, name in rows:
+        b = bars.get(code) or {}
+        base = b.get(date)
+        if not base or not base[1]:
+            continue
+        base_close = float(base[1])
+        next_open = float(b[nxt][0]) if nxt and b.get(nxt) and b[nxt][0] else None
+        last_date, last_close, peak = None, None, base_close
+        for d in window:
+            v = b.get(d)
+            if not v:
+                continue
+            last_date, last_close = d, float(v[1])
+            peak = max(peak, float(v[2]) if v[2] else float(v[1]))
+        if last_close is None:
+            continue
+        out.append((code, name, base_close, next_open, last_date, last_close,
+                    (last_close / base_close - 1) * 100,
+                    ((last_close / next_open - 1) * 100) if next_open else None,
+                    (peak / base_close - 1) * 100))
+    return out
+
+
+def _pct(v):
+    return '—' if v is None else f'{v:+.2f}%'
+
+
+def perf_lines(date: str, rows: list, bars: dict, trade_days: list) -> list:
+    """生成单条记录的「后续表现」markdown。"""
+    perf = perf_for(date, rows, bars, trade_days)
+    if not perf:
+        return []
+    last = max(p[4] for p in perf)
+    L = ['## 后续表现（自推荐日起，T+5 冻结）', '',
+         f'> 基准两个都给：**推荐日收盘**（推荐口径）与**次日开盘**'
+         f'（策略实际可买到的价格，更接近真实成交）。',
+         f'> 数据截至 `{last}`。', '',
+         '| 代码 | 名称 | 推荐日收盘 | 次日开盘 | 最新收盘 | 自推荐日 | 自次日开盘 | 区间最高 |',
+         '|---|---|---|---|---|---|---|---|']
+    for (code, name, bc, no_, ld, lc, r1, r2, mg) in perf:
+        L.append(f'| {code} | {name} | {bc:g} | {no_:g} | {lc:g} '
+                 f'| {_pct(r1)} | {_pct(r2)} | {_pct(mg)} |')
+    L.append('')
+    return L
+
+
+def build_record(date: str, df: pd.DataFrame, env: dict | None,
+                 perf_md: list | None = None) -> str:
     """生成明文 markdown 记录（格式对齐历史 records/ 文件）。"""
     date_iso = f'{date[:4]}-{date[4:6]}-{date[6:8]}'
     rec = df[df.get('推荐') == '推荐'].copy() if '推荐' in df.columns else df.iloc[0:0]
@@ -140,6 +250,8 @@ def build_record(date: str, df: pd.DataFrame, env: dict | None) -> str:
                 L.append(f'    - 次日：{plan}')
         L.append('')
 
+    if perf_md:
+        L += perf_md
     L += ['---', '',
           f'> 完整数据：`reports/v2_candidates_{date}.csv`',
           '> ⚠️ 学习用途，非投资建议。', '']
@@ -227,7 +339,18 @@ def archive_one(date: str, do_push: bool, do_encrypt: bool,
     outdir = os.path.join(ROOT, 'records', date[:4], date[4:6])
     os.makedirs(outdir, exist_ok=True)
     outpath = os.path.join(outdir, f'{date[6:8]}.md')
-    body = build_record(date, df, env)
+
+    # 推荐股后续表现（自推荐日起算，T+5 冻结）
+    perf_md = []
+    if '推荐' in df.columns and '代码' in df.columns:
+        rec_df = df[df['推荐'] == '推荐']
+        if len(rec_df):
+            rows = [(str(r['代码']).zfill(6), str(r.get('名称', '')))
+                    for _, r in rec_df.iterrows()]
+            perf_md = perf_lines(date, rows,
+                                 read_bars([c for c, _ in rows]),
+                                 market_trade_days())
+    body = build_record(date, df, env, perf_md)
 
     changed = True
     if os.path.exists(outpath) and not force:
@@ -280,8 +403,8 @@ def main() -> int:
     ap.add_argument('--encrypt', action='store_true',
                     help='额外生成加密版（原方案：次日公布口令）')
     ap.add_argument('--no-push', action='store_true', help='只提交不推送')
-    ap.add_argument('--catchup', type=int, default=7,
-                    help='默认模式下回溯天数（补齐漏跑，默认 7）')
+    ap.add_argument('--catchup', type=int, default=10,
+                    help='默认模式下回溯天数（补齐漏跑与未冻结的表现窗口，默认 10）')
     ap.add_argument('--force', action='store_true', help='覆盖已存在的记录')
     args = ap.parse_args()
 
@@ -300,6 +423,20 @@ def main() -> int:
         today = datetime.now()
         dates = [(today - timedelta(days=i)).strftime('%Y%m%d')
                  for i in range(args.catchup + 1)]
+
+    # 归档前先把「被跟踪的推荐股」K线补到最新（一次去重，失败不阻断归档）
+    tracked = set()
+    for d in dates:
+        p = os.path.join(CSV_DIR, f'v2_candidates_{d}.csv')
+        if not os.path.exists(p):
+            continue
+        try:
+            t = pd.read_csv(p, dtype={'代码': str})
+            if '推荐' in t.columns and '代码' in t.columns:
+                tracked |= {str(c).zfill(6) for c in t.loc[t['推荐'] == '推荐', '代码']}
+        except Exception:
+            pass
+    refresh_tracked(sorted(tracked))
 
     results = [archive_one(d, not args.no_push, args.encrypt, args.force)
                for d in dates]
