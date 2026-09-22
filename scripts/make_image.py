@@ -71,32 +71,68 @@ def stage_dist(df: pd.DataFrame) -> list:
     return [(str(k), int(v)) for k, v in vc.items()]
 
 
-def full_table(date: str, rows: list, bars: dict, tdays: list,
-               rules: dict) -> str:
-    """内部版：推荐个股 + 模拟交易（含个股，不可公开）。"""
-    sims = {r['code']: A.simulate_trade(date, r, bars, tdays, rules)
-            for r in rows}
-    tr = ['<table><thead><tr><th>代码</th><th>名称</th><th>买入价</th>'
-          '<th>卖出日</th><th>卖出价</th><th>原因</th><th>收益</th></tr></thead><tbody>']
-    for r in rows:
-        s = sims.get(r['code']) or {}
-        if s.get('status') == '已了结':
-            ret = s['ret_pct']
-            cls = 'up' if ret > 0 else 'down'
-            tr.append(
-                f"<tr><td>{esc(r['code'])}</td><td>{esc(r['name'])}</td>"
-                f"<td>{s['buy_price']:g}</td><td>{s['sell_date'][5:]}</td>"
-                f"<td>{s['sell_price']:g}</td>"
-                f"<td class='rs'>{esc(s['reason'])}</td>"
-                f"<td class='{cls}'>{ret:+.2f}%</td></tr>")
-        else:
-            tr.append(
-                f"<tr><td>{esc(r['code'])}</td><td>{esc(r['name'])}</td>"
-                f"<td>—</td><td>—</td><td>—</td>"
-                f"<td class='rs'>{esc(s.get('reason', s.get('status', '—')))}</td>"
-                f"<td>—</td></tr>")
-    tr.append('</tbody></table>')
-    return ''.join(tr)
+def full_detail(df: pd.DataFrame, date: str, sims: dict,
+                infos: dict) -> str:
+    """内部版：逐只推荐卡片，内容对齐文字版（元信息 + 公司简析 + 买卖点 + 次日计划 + 模拟交易）。"""
+    rec = df[df['推荐'] == '推荐'] if '推荐' in df.columns else df.iloc[0:0]
+    if rec.empty:
+        return ('<div class="sec">推荐明细<span class="warn">内部版</span></div>'
+                '<div class="empty">今日无介入信号（仅观察池）</div>')
+    num = '①②③④⑤⑥⑦⑧⑨⑩'
+    out = ['<div class="sec">推荐明细 · 内部版'
+           '<span class="warn">含个股 · 勿公开</span></div>']
+    try:
+        from company_info import format_analysis
+    except Exception:                                         # noqa: BLE001
+        format_analysis = None
+    for i, (_, r) in enumerate(rec.iterrows()):
+        code = str(r['代码']).zfill(6)
+        stage = str(r.get('阶段', '')).replace('(介入信号)', '')
+        mcap, key = r.get('流通市值亿'), r.get('关键位')
+        meta = f"{code}｜{r.get('行业', '-')}｜{r.get('总分')}分"
+        if pd.notna(mcap):
+            meta += f' {float(mcap):.0f}亿'
+        meta += f'｜{stage}'
+        if pd.notna(key) and key != '':
+            meta += f' 关键位{key}'
+        out.append('<div class="stock">')
+        out.append(f'<div class="s-head"><span class="idx">'
+                   f'{num[i] if i < len(num) else str(i + 1) + "."}</span>'
+                   f'<b>{esc(r.get("名称", ""))}</b>'
+                   f'<span class="meta">{esc(meta)}</span></div>')
+        if format_analysis:
+            try:
+                fa = format_analysis(code, infos.get(code) or {})
+            except Exception:                                 # noqa: BLE001
+                fa = ''
+            if fa:
+                out.append(f'<div class="s-line">📋 {esc(fa)}</div>')
+        pts = []
+        for lbl, col, pre in (('低吸', '低吸位', '≥'), ('追涨', '追涨位', ' 放量破'),
+                              ('止损', '止损位', ' ')):
+            v = r.get(col)
+            if pd.notna(v) and v != '':
+                pts.append(f'{lbl}{pre}{v}')
+        if pts:
+            out.append(f'<div class="s-line">买卖点：'
+                       f'{" ｜ ".join(pts)}</div>')
+        plan = str(r.get('次日计划') or '').strip()
+        if plan:
+            out.append(f'<div class="s-line">次日：{esc(plan)}</div>')
+        s = sims.get(code)
+        if s:
+            if s.get('status') == '已了结':
+                cls = 'up' if s['ret_pct'] > 0 else 'down'
+                out.append(
+                    f'<div class="s-line sim">模拟交易：{s["buy_date"]} 买入 '
+                    f'{s["buy_price"]:g} → {s["sell_date"]} '
+                    f'{s["sell_price"]:g}（{esc(s["reason"])}）'
+                    f' <b class="{cls}">{s["ret_pct"]:+.2f}%</b></div>')
+            else:
+                out.append(f'<div class="s-line sim">模拟交易：'
+                           f'{esc(s.get("reason", s.get("status", "")))}</div>')
+        out.append('</div>')
+    return ''.join(out)
 
 
 def render_html(date: str, profile: str, df: pd.DataFrame, env: dict,
@@ -153,19 +189,25 @@ def render_html(date: str, profile: str, df: pd.DataFrame, env: dict,
 
     full_html = ''
     if profile == 'full':
+        p_rec = os.path.join(ROOT, 'records', date[:4], date[4:6],
+                             f'{date[6:8]}.md')
         rows = A.parse_rec_table(
-            open(os.path.join(ROOT, 'records', date[:4], date[4:6],
-                              f'{date[6:8]}.md'), encoding='utf-8'
-                 ).read().split('## 推荐股票')[-1].split('## 买卖参考')[0]) \
-            if os.path.exists(os.path.join(ROOT, 'records', date[:4],
-                                           date[4:6], f'{date[6:8]}.md')) else []
+            open(p_rec, encoding='utf-8').read().split('## 推荐股票')[-1]
+            .split('## 买卖参考')[0]) if os.path.exists(p_rec) else []
         if rows:
             bars = A.read_bars([r['code'] for r in rows])
-            full_html = ('<div class="sec">推荐明细 · 模拟交易'
-                         '<span class="warn">内部版 · 勿公开</span></div>'
-                         + full_table(date, rows, bars,
-                                      A.market_trade_days(),
-                                      A.load_exit_rules()))
+            tdays, rules = A.market_trade_days(), A.load_exit_rules()
+            sims = {r['code']: A.simulate_trade(date, r, bars, tdays, rules)
+                    for r in rows}
+            infos = {}
+            try:
+                sys.path.insert(0, os.path.join(ROOT, '..', 'strategy_v2', 'src'))
+                from company_info import analyze
+                infos = analyze([r['code'] for r in rows],
+                                with_financials=True)
+            except Exception as e:                            # noqa: BLE001
+                print(f'[warn] 公司简析获取失败（跳过该段）：{e}')
+            full_html = full_detail(df, date, sims, infos)
 
     badge = ('合规版 · 不含个股' if profile == 'public'
              else '内部版 · 含个股')
@@ -229,6 +271,14 @@ def render_html(date: str, profile: str, df: pd.DataFrame, env: dict,
   th,td {{ padding:11px 8px; border-bottom:1px solid #21262d; text-align:left; }}
   th {{ color:#8b949e; font-weight:500; font-size:21px; }}
   td.rs {{ font-size:19px; color:#8b949e; }}
+  .stock {{ background:#161b22; border:1px solid #21262d; border-radius:14px;
+            padding:18px 22px; margin-bottom:14px; }}
+  .s-head {{ display:flex; align-items:baseline; flex-wrap:wrap; gap:10px; }}
+  .s-head .idx {{ color:#f85149; font-size:26px; }}
+  .s-head b {{ font-size:32px; }}
+  .s-head .meta {{ font-size:22px; color:#8b949e; }}
+  .s-line {{ font-size:22px; color:#c9d1d9; line-height:1.6; margin-top:9px; }}
+  .s-line.sim {{ color:#8b949e; font-size:21px; }}
   .empty {{ font-size:24px; color:#8b949e; }}
   .signal {{ margin-top:26px; padding:22px 28px; border-radius:16px;
              display:flex; align-items:center; justify-content:space-between;
@@ -346,34 +396,76 @@ def one(date: str, profile: str) -> str | None:
     return None
 
 
-def send_feishu(paths: list) -> int:
-    """把生成的图片发到飞书群/私聊（复用 OpenClaw 已配置的机器人凭证）。"""
+def feishu_ctx():
+    """返回 (token, {'group': chat_id, 'dm': open_id})；失败返回 (None, {})。"""
     try:
         sys.path.insert(0, os.path.join(ROOT, '..', 'screener', 'src'))
         from feishu_push import (get_tenant_token, load_app_credentials,
-                                 resolve_receive, send_image_to)
+                                 load_group_chat_id, load_user_open_id)
     except Exception as e:                                    # noqa: BLE001
         print(f'[feishu] 无法加载推送模块：{e}')
-        return 0
+        return None, {}
     cred = load_app_credentials()
     if not cred:
         print('[feishu] 未找到 appId/appSecret（~/.openclaw/openclaw.json），跳过')
-        return 0
-    rid, rtype = resolve_receive()
-    if not rid:
-        print('[feishu] 未配置接收目标（群 chat_id / 用户 open_id），跳过')
-        return 0
+        return None, {}
     token = get_tenant_token(*cred)
     if not token:
         print('[feishu] 获取 tenant_access_token 失败')
-        return 0
-    who = (f'群 {rid[:12]}...' if rtype == 'chat_id' else f'open_id {rid[:8]}...')
+        return None, {}
+    return token, {'group': load_group_chat_id(), 'dm': load_user_open_id()}
+
+
+def _marker(path: str, rid: str) -> str:
+    d = os.path.join(ROOT, '.logs')
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, f'sent-{os.path.basename(path)}-{rid[:8]}')
+
+
+def send_items(token: str, items: list, force: bool = False) -> int:
+    """items: [(图片路径, receive_id, receive_id_type, 说明), ...]
+
+    幂等：每个 (图片, 收件人) 组合发成功后写标记，重复调用跳过
+    —— 归档任务 16:00~21:00 每小时触发，没有这道保护会一天发 6 次。
+    """
+    from feishu_push import send_image_to
     n = 0
-    for p in paths:
-        if p and send_image_to(token, rid, rtype, p):
-            print(f'[feishu] 已发送 {os.path.basename(p)} → {who}')
+    for p, rid, rtype, who in items:
+        if not p or not rid:
+            print(f'[feishu] 跳过 {os.path.basename(p) if p else "?"} → {who}（缺图片或未配置目标）')
+            continue
+        mk = _marker(p, rid)
+        if os.path.exists(mk) and not force:
+            print(f'[feishu] {os.path.basename(p)} → {who} 今天已发过，跳过')
+            continue
+        if send_image_to(token, rid, rtype, p):
+            open(mk, 'w').write(datetime.now().isoformat())
+            print(f'[feishu] ✅ {os.path.basename(p)} → {who}')
             n += 1
     return n
+
+
+# 路由：群里发完整版（自己看），私聊发合规版（好编辑发抖音）
+ROUTES = [('full', 'group', 'chat_id', '群'),
+          ('public', 'dm', 'open_id', '私聊')]
+
+
+def send_routed(date: str, force: bool = False) -> int:
+    """按路由发送当日图片：群=完整版，私聊=隐藏版。"""
+    token, tg = feishu_ctx()
+    if not token:
+        return 0
+    items = []
+    for prof, key, rtype, who in ROUTES:
+        rid = tg.get(key)
+        if not rid:
+            print(f'[feishu] {who} 未配置目标，跳过 {prof} 版')
+            continue
+        p = os.path.join(OUTDIR, f'{date}-{prof}.png')
+        if not os.path.exists(p):
+            p = one(date, prof)
+        items.append((p, rid, rtype, who))
+    return send_items(token, items, force)
 
 
 def main() -> int:
@@ -382,9 +474,11 @@ def main() -> int:
     ap.add_argument('--profile', choices=['public', 'full'], default='public')
     ap.add_argument('--all-recent', action='store_true',
                     help='近 5 个交易日各出一张')
-    ap.add_argument('--feishu', choices=['public', 'full', 'both'],
-                    default=None,
-                    help='把图片发到飞书（public=合规版 / full=内部版 / both）')
+    ap.add_argument('--feishu', choices=['public', 'full', 'both'], default=None,
+                    help='手动发送指定版本到默认目标（群优先）')
+    ap.add_argument('--feishu-route', action='store_true',
+                    help='按路由发送：群=完整版，私聊=隐藏版（每日任务用这个）')
+    ap.add_argument('--force-send', action='store_true', help='忽略已发标记，重发')
     args = ap.parse_args()
     dates = []
     if args.all_recent:
@@ -396,21 +490,24 @@ def main() -> int:
     made = [one(d, args.profile) for d in dates]
     ok = sum(1 for p in made if p)
 
-    if args.feishu:
+    if args.feishu_route:
+        for d in dates:
+            send_routed(d, force=args.force_send)
+    elif args.feishu:
         want = {'public': ['public'], 'full': ['full'],
                 'both': ['public', 'full']}[args.feishu]
-        send_paths = []
-        for d in dates:
-            for prof in want:
-                p = os.path.join(OUTDIR, f'{d}-{prof}.png')
-                if not os.path.exists(p):
-                    one(d, prof)
-                if os.path.exists(p):
-                    send_paths.append(p)
-        if send_paths:
-            send_feishu(send_paths)
-        else:
-            print('[feishu] 没有可发送的图片')
+        token, tg = feishu_ctx()
+        if token:
+            rid = tg.get('group') or tg.get('dm')
+            rtype = 'chat_id' if tg.get('group') else 'open_id'
+            items = []
+            for d in dates:
+                for prof in want:
+                    p = os.path.join(OUTDIR, f'{d}-{prof}.png')
+                    if not os.path.exists(p):
+                        p = one(d, prof)
+                    items.append((p, rid, rtype, '飞书'))
+            send_items(token, items, force=args.force_send)
 
     print(f'完成：{ok}/{len(dates)} 张 → {OUTDIR}')
     return 0
