@@ -219,7 +219,7 @@ def render_html(date: str, profile: str, df: pd.DataFrame, env: dict,
            font-size:21px; color:#6e7681; line-height:1.7; }}
 </style></head><body><div class="wrap">
   <div class="badge {badge_cls}">{esc(badge)}</div>
-  <h1>A股盘面 · 量化策略记录</h1>
+  <h1>A股盘面 · 陈学长选股策略</h1>
   <div class="sub">{d_iso} 星期{wd} ｜ 数据截至 {esc(env.get('data_date', d_iso))}</div>
 
   <div class="env">
