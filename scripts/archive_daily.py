@@ -951,6 +951,7 @@ def main() -> int:
     results = [_one(d) for d in dates]
     rebuild_index()
     rebuild_perf()
+    rebuild_stats()
     if args.backfill_history:
         log(f'历史回填：{backfill_history()} 条记录已补上表现段落')
     if args.image:
