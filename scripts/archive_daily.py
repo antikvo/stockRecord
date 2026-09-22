@@ -133,7 +133,7 @@ def perf_for(date: str, rows: list, bars: dict, trade_days: list) -> list:
             ret_from_rec, ret_from_open, max_gain), ...]
     基准两个都给：推荐日收盘（用户口径）+ 次日开盘（策略实际可买到的价格）。
     """
-    if not rows or date not in trade_days:
+    if not rows:
         return []
     # 库内日期为 ISO（YYYY-MM-DD），归档脚本用 YYYYMMDD，这里统一转换
     d_iso = f'{date[:4]}-{date[4:6]}-{date[6:8]}'
