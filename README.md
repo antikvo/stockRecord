@@ -113,7 +113,7 @@ python3 scripts/archive_daily.py --backfill 20260915 20260922
 
 <!-- PERF:BEGIN -->
 
-> 近 5 个交易日（`2026-09-23` ~ `2026-09-30`）的推荐表现。
+> 近 5 个交易日（`2026-09-24` ~ `2026-10-08`）的推荐表现。
 > 逐日推进：推荐日记为**第 1 日**，次日开盘 = 第 2 日开盘（策略实际可买到的价格）。
 > 模拟交易规则取自 `trade_advisor/config.yaml`：破止损 → 卖出；满 5 个交易日 → 了结；触及压力位且浮盈 ≥6% → 止盈。
 
@@ -134,6 +134,10 @@ python3 scripts/archive_daily.py --backfill 20260915 20260922
 <!-- INDEX:BEGIN -->
 
 > 数据来源：陈学长选股策略 v2 的每日推荐报告（`~/stock/strategy_v2/reports/v2_candidates_*.csv`）。本索引由 `scripts/archive_daily.py` 自动重建。
+
+### 2026 年 10 月
+
+- [10-08](records/2026/10/08.md) — 推荐 0 只（环境：混沌，高炸板(谨慎)）
 
 ### 2026 年 09 月
 
